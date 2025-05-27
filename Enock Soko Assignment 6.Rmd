@@ -1,0 +1,265 @@
+---
+title: "Assignment 6"
+author: "Enock Soko"
+date: "`r Sys.Date()`"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(brms)
+library(tidybayes)
+library(kableExtra)
+
+```
+
+# Introduction
+
+In this report I will analyse group presentation marks assessed by multiple lecturers with incomplete overlap in which presentations they assessed. My goal is to produce fair marks for each group while accounting for assessor biases.
+
+# Question 1: Residual Variability
+
+The residual (error) variability in this problem comes from several sources:
+
+*Assessor biases*: Each lecturer may have their own tendencies to mark higher or lower on average (fixed effects) and may vary in their strictness (random effects).
+
+*Presentation variability*: Even the same group might perform differently on different occasions due to factors like nerves, technical issues, or time of day.
+
+*Rubric interpretation*: Different assessors may interpret the rubric criteria slightly differently.
+
+*Group dynamics*: The specific combination of assessors and groups may create unique interactions not accounted for in the model.
+
+# Question 2: Average Assessor Mark Assumptions
+
+If all assessors viewed all students and were equally neutral then the current assumptions would likely be sufficient for the average mark to be correct on average
+
+However these would be additional assuptions needed:
+
+-   All assessors have equal expertise in evaluating the presentations
+
+-   The rubric is applied consistently across all presentations
+
+-   No systematic patterns in missing data (missing completely at random)
+
+-   No interaction effects between assessors and groups
+
+# Question 3: Summary of data properties
+
+## Loading Data and Initial Exploration
+
+```{r}
+data <- read_delim("BayesAssignment6of2025.csv", delim = ";")
+
+head(data) %>% kable() %>% kable_styling()
+```
+
+### Missing Data Patterns
+
+```{r}
+missing_summary <- data %>% 
+  summarise(across(everything(), ~sum(is.na(.)))) %>% 
+  pivot_longer(everything(), names_to = "Variable", values_to = "Missing Count")
+
+missing_summary %>% kable() %>% kable_styling()
+
+
+library(naniar)
+gg_miss_upset(data)
+
+```
+
+The dataset contains the following:
+
+-   13 student groups (Group1-Group13)
+
+-   9 potential assessors (LecturerA-LecturerI)
+
+-   4 previous performance measures (Proposal, Literature, Quiz, Interview)
+
+-   Marks range from 52 to 96
+
+When it comes Missingness patterns we observe the following:
+
+-   Not all lecturers assessed all groups (sparse design)
+
+-   Some groups have more assessments than others
+
+-   Previous performance measures are complete except for Group5 missing Interview
+
+# Question 4: Transforming our data to Long Format
+
+```{r}
+
+long_data <- data %>% 
+  pivot_longer(
+    cols = starts_with("Lecturer"),
+    names_to = "Lecturer",
+    values_to = "Mark",
+    values_drop_na = TRUE
+  ) %>% 
+  select(Group, Lecturer, Mark, Proposal, Literature, Quiz, Interview)
+
+head(long_data) %>% kable() %>% kable_styling()
+
+```
+
+# Question 5: Fixed vs Random Effects
+
+**Fixed Effects**:
+
+*Group*: We want explicit estimates for each group's performance
+
+*Previous marks* (Proposal, Literature, Quiz, Interview): These are known covariates that should affect the current mark
+
+**Random Effects**:
+
+*Lecturer*: We expect lecturers to have random biases (some more generous, some stricter)
+
+*Group-Lecturer interaction*: Allows for the possibility that certain lecturers grade certain groups differently
+
+**Rationale**:
+
+Groups are of direct interest (fixed)
+
+Lecturers are a sample from a larger population of potential assessors (random)
+
+Previous marks are objective measures that should influence current marks (fixed)
+
+
+
+# Question 6: Model Fitting
+
+```{r}
+
+priors <- c(
+  prior(normal(0, 10), class = "b"),                                            # Fixed effects
+  prior(normal(0, 5), class = "Intercept"),                                     # Global intercept
+  prior(cauchy(0, 2), class = "sd")                                             # Random effect SDs
+)
+
+model <- brm(
+  Mark ~ Group + Proposal + Literature + Quiz + Interview + (1 | Lecturer),
+  data = long_data,
+  prior = priors,
+  chains = 4,
+  iter = 4000,
+  cores = 4,
+  seed = 123,
+  control = list(adapt_delta = 0.95)
+)
+
+summary(model)
+```
+
+# Question 7: Group Mark Estimates
+
+```{r}
+
+group_estimates <- emmeans(model, ~Group) %>% 
+  as_tibble() %>% 
+  select(Group, estimate = emmean, lower.HPD, upper.HPD) %>% 
+  mutate(across(estimate:upper.HPD, ~round(., 2)))
+
+pred_intervals <- posterior_predict(model, newdata = distinct(long_data, Group)) %>% 
+  apply(2, quantile, probs = c(0.025, 0.975)) %>% 
+  t() %>% 
+  as_tibble() %>% 
+  rename(pred_lower = `2.5%`, pred_upper = `97.5%`) %>% 
+  mutate(Group = unique(long_data$Group))
+
+final_estimates <- left_join(group_estimates, pred_intervals, by = "Group")
+
+final_estimates %>% 
+  kable() %>% 
+  kable_styling()
+
+```
+
+
+# Question 8: Assessor Biases
+
+
+```{r}
+
+lecturer_effects <- ranef(model)$Lecturer %>% 
+  as_tibble(rownames = "Lecturer") %>% 
+  select(Lecturer, Bias = Estimate.Intercept, SE = Est.Error.Intercept) %>% 
+  arrange(Bias)
+
+lecturer_effects %>% 
+  kable() %>% 
+  kable_styling()
+
+least_biased <- lecturer_effects %>% 
+  filter(abs(Bias) == min(abs(Bias)))
+
+cat("The least biased lecturer is", least_biased$Lecturer, "with a bias of", 
+    round(least_biased$Bias, 2), "\n")
+```
+
+
+# Question 9: Incorporating Previous Marks
+
+```{r}
+
+group_means <- long_data %>% 
+  group_by(Group) %>% 
+  summarise(
+    prev_mean = mean(c(Proposal, Literature, Quiz, Interview), na.rm = TRUE),
+    prev_sd = sd(c(Proposal, Literature, Quiz, Interview), na.rm = TRUE)
+  )
+
+prior_means <- group_means$prev_mean
+names(prior_means) <- paste0("Group", group_means$Group)
+
+subjective_model <- brm(
+  Mark ~ Group + Proposal + Literature + Quiz + Interview + (1 | Lecturer),
+  data = long_data,
+  prior = c(
+    prior(normal(prior_means, 5), class = "b", coef = paste0("Group", unique(long_data$Group))),
+    prior(normal(0, 5), class = "Intercept"),
+    prior(cauchy(0, 2), class = "sd")
+  ),
+  chains = 4,
+  iter = 4000,
+  cores = 4,
+  seed = 123
+)
+
+loo_compare(loo(model), loo(subjective_model))
+
+# The effect on estimates is that groups with strong previous performance will be pulled slightly
+# toward higher marks, and vice versa. The intervals may become slightly narrower when
+# incorporating this additional information.
+
+```
+
+
+# Question 10: Differentiating Individual Performance
+
+**Practical strategy for individual differentiation**:
+
+*Peer assessment*: Have group members confidentially rate each other's contributions
+
+*Individual components*: Include some individually-assessed portions (e.g., Q&A session)
+
+*Assessor training*: Train assessors to look for and record individual contributions
+
+*Rubric refinement*: Include specific criteria for individual performance within group work
+
+*Self-assessment*: Have students reflect on and justify their own contributions
+
+
+**To combat assessor laziness bias**:
+
+- Make individual assessment mandatory in the rubric
+
+- Provide clear guidelines on what constitutes individual contribution
+
+- Use simple rating scales for quick assessment
+
+- Randomly verify some assessments for quality control
+
+
